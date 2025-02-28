@@ -235,8 +235,9 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
         return Ok(Vec::new());
     }
 
+    // Run flatpak search with --columns=name,version,description to get proper fields
     let output = Command::new("flatpak")
-        .args(&["search", term])
+        .args(&["search", "--columns=name,application,version,description", term])
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -255,14 +256,15 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
         
         let parts: Vec<&str> = line.split('\t').collect();
         
-        if parts.len() >= 3 {
+        if parts.len() >= 4 {
             let name = parts[0].trim();
-            let version = match parts.get(1) {
+            let application_id = parts[1].trim();
+            let version = match parts.get(2) {
                 Some(&v) if !v.trim().is_empty() => v.trim().to_string(),
                 _ => "Unknown".to_string(),
             };
             
-            let description = match parts.get(2) {
+            let description = match parts.get(3) {
                 Some(&d) if !d.trim().is_empty() => d.trim().to_string(),
                 _ => "No description.".to_string(),
             };
@@ -270,7 +272,7 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
             // Only add if the package matches the search term
             if name.to_lowercase().contains(&term.to_lowercase()) {
                 results.push(PackageInfo {
-                    name: name.to_string(),
+                    name: format!("{} ({})", name, application_id),
                     version,
                     description,
                 });
