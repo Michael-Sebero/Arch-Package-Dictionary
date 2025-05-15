@@ -1,8 +1,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::env;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
-use futures::future::join_all;
+use tokio::sync::mpsc;
 
 // ANSI color codes as constants
 const BOLD: &str = "\x1B[1m";
@@ -11,7 +12,7 @@ const RED: &str = "\x1B[31m";
 const GREEN: &str = "\x1B[32m";
 const RESET: &str = "\x1B[0m";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PackageInfo {
     name: String,
     version: String,
@@ -28,12 +29,15 @@ fn main() {
 
     let search_term = args[1..].join(" ");
     
-    // Create a tokio runtime for async operations
-    let rt = Runtime::new().expect("Failed to create runtime");
+    // Create a tokio runtime with multi-threaded executor
+    let rt = Runtime::new()
+        .expect("Failed to create runtime");
     
-    // Add error handling for the async search
+    // Execute search with better error handling
     match rt.block_on(search_packages(&search_term)) {
-        Ok(results) => print_results_with_pager(&results),
+        Ok(results) => {
+            print_results_with_pager(&results);
+        },
         Err(e) => {
             eprintln!("{}Error:{} Failed to search packages: {}", RED, RESET, e);
             std::process::exit(1);
@@ -42,56 +46,93 @@ fn main() {
 }
 
 async fn search_packages(term: &str) -> Result<(Vec<PackageInfo>, Vec<PackageInfo>, Vec<PackageInfo>), Box<dyn std::error::Error>> {
-    // Clone the term once for each async task
-    let term_pacman = term.to_string();
-    let term_aur = term.to_string();
-    let term_flatpak = term.to_string();
+    // Use a shared string to avoid cloning for each search function
+    let term = Arc::new(term.to_string());
     
-    // Create three async tasks for concurrent execution
-    let pacman_search = tokio::spawn(async move {
-        search_pacman(&term_pacman)
+    // Set up channels for returning results asynchronously
+    let (pacman_tx, mut pacman_rx) = mpsc::channel(1);
+    let (aur_tx, mut aur_rx) = mpsc::channel(1);
+    let (flatpak_tx, mut flatpak_rx) = mpsc::channel(1);
+    
+    // Clone Arc references for each task
+    let term_pacman = Arc::clone(&term);
+    let term_aur = Arc::clone(&term);
+    let term_flatpak = Arc::clone(&term);
+    
+    // Spawn tasks with proper error handling
+    tokio::spawn(async move {
+        let result = search_pacman(&term_pacman).await;
+        let _ = pacman_tx.send(result).await;
     });
     
-    let aur_search = tokio::spawn(async move {
-        search_aur(&term_aur)
+    tokio::spawn(async move {
+        let result = search_aur(&term_aur).await;
+        let _ = aur_tx.send(result).await;
     });
     
-    let flatpak_search = tokio::spawn(async move {
-        search_flatpak(&term_flatpak)
+    tokio::spawn(async move {
+        let result = search_flatpak(&term_flatpak).await;
+        let _ = flatpak_tx.send(result).await;
     });
 
-    // Wait for all searches to complete
-    let results = join_all(vec![pacman_search, aur_search, flatpak_search]).await;
+    // Collect results with timeout
+    let pacman_results = match tokio::time::timeout(std::time::Duration::from_secs(5), pacman_rx.recv()).await {
+        Ok(Some(Ok(results))) => results,
+        Ok(Some(Err(e))) => {
+            eprintln!("{}Warning:{} Pacman search failed: {}", RED, RESET, e);
+            Vec::new()
+        },
+        Ok(None) => {
+            eprintln!("{}Warning:{} Pacman search channel closed unexpectedly", RED, RESET);
+            Vec::new()
+        },
+        Err(_) => {
+            eprintln!("{}Warning:{} Pacman search timed out", RED, RESET);
+            Vec::new()
+        },
+    };
     
-    // Unwrap the results, using empty vectors as fallback
-    let mut final_results = (Vec::new(), Vec::new(), Vec::new());
+    let aur_results = match tokio::time::timeout(std::time::Duration::from_secs(5), aur_rx.recv()).await {
+        Ok(Some(Ok(results))) => results,
+        Ok(Some(Err(e))) => {
+            eprintln!("{}Warning:{} AUR search failed: {}", RED, RESET, e);
+            Vec::new()
+        },
+        Ok(None) => {
+            eprintln!("{}Warning:{} AUR search channel closed unexpectedly", RED, RESET);
+            Vec::new()
+        },
+        Err(_) => {
+            eprintln!("{}Warning:{} AUR search timed out", RED, RESET);
+            Vec::new()
+        },
+    };
     
-    // Better error handling for each search
-    match &results[0] {
-        Ok(Ok(pacman_results)) => final_results.0 = pacman_results.to_vec(),
-        Ok(Err(e)) => eprintln!("{}Warning:{} Pacman search failed: {}", RED, RESET, e),
-        Err(e) => eprintln!("{}Warning:{} Pacman task failed: {}", RED, RESET, e),
-    }
-    
-    match &results[1] {
-        Ok(Ok(aur_results)) => final_results.1 = aur_results.to_vec(),
-        Ok(Err(e)) => eprintln!("{}Warning:{} AUR search failed: {}", RED, RESET, e),
-        Err(e) => eprintln!("{}Warning:{} AUR task failed: {}", RED, RESET, e),
-    }
-    
-    match &results[2] {
-        Ok(Ok(flatpak_results)) => final_results.2 = flatpak_results.to_vec(),
-        Ok(Err(e)) => eprintln!("{}Warning:{} Flatpak search failed: {}", RED, RESET, e),
-        Err(e) => eprintln!("{}Warning:{} Flatpak task failed: {}", RED, RESET, e),
-    }
+    let flatpak_results = match tokio::time::timeout(std::time::Duration::from_secs(5), flatpak_rx.recv()).await {
+        Ok(Some(Ok(results))) => results,
+        Ok(Some(Err(e))) => {
+            eprintln!("{}Warning:{} Flatpak search failed: {}", RED, RESET, e);
+            Vec::new()
+        },
+        Ok(None) => {
+            eprintln!("{}Warning:{} Flatpak search channel closed unexpectedly", RED, RESET);
+            Vec::new()
+        },
+        Err(_) => {
+            eprintln!("{}Warning:{} Flatpak search timed out", RED, RESET);
+            Vec::new()
+        },
+    };
 
-    Ok(final_results)
+    Ok((pacman_results, aur_results, flatpak_results))
 }
 
-fn search_pacman(term: &str) -> std::io::Result<Vec<PackageInfo>> {
-    let output = Command::new("pacman")
+async fn search_pacman(term: &str) -> std::io::Result<Vec<PackageInfo>> {
+    // Use tokio process for async execution
+    let output = tokio::process::Command::new("pacman")
         .args(&["-Ss", term])
-        .output()?;
+        .output()
+        .await?;
     
     let stdout = String::from_utf8_lossy(&output.stdout);
     
@@ -99,7 +140,8 @@ fn search_pacman(term: &str) -> std::io::Result<Vec<PackageInfo>> {
         return Ok(Vec::new());
     }
     
-    let mut results = Vec::new();
+    // Pre-allocate with approximate capacity
+    let mut results = Vec::with_capacity(stdout.lines().count() / 2);
     let mut lines = stdout.lines().peekable();
     
     while let Some(line) = lines.next() {
@@ -110,14 +152,11 @@ fn search_pacman(term: &str) -> std::io::Result<Vec<PackageInfo>> {
                 let name_version: Vec<&str> = parts[1].splitn(2, ' ').collect();
                 if name_version.len() == 2 {
                     let name = name_version[0].trim();
-                    // Extract version from the remaining part
+                    // Extract version from the remaining part more efficiently
                     let version_part = name_version[1].trim();
-                    let version = if version_part.starts_with('(') && version_part.contains(')') {
-                        // Extract what's inside the parentheses
-                        let v_start = version_part.find('(').unwrap_or(0) + 1;
-                        let v_end = version_part.find(')').unwrap_or(version_part.len());
-                        if v_start < v_end {
-                            version_part[v_start..v_end].to_string()
+                    let version = if let (Some(start), Some(end)) = (version_part.find('('), version_part.find(')')) {
+                        if start < end && start + 1 < version_part.len() {
+                            version_part[start+1..end].to_string()
                         } else {
                             version_part.to_string()
                         }
@@ -126,14 +165,9 @@ fn search_pacman(term: &str) -> std::io::Result<Vec<PackageInfo>> {
                     };
                     
                     // Get description from the next line if available
-                    let description = if let Some(desc_line) = lines.next() {
-                        if desc_line.trim().is_empty() {
-                            "No description.".to_string()
-                        } else {
-                            desc_line.trim().to_string()
-                        }
-                    } else {
-                        "No description.".to_string()
+                    let description = match lines.next() {
+                        Some(desc_line) if !desc_line.trim().is_empty() => desc_line.trim().to_string(),
+                        _ => "No description.".to_string(),
                     };
                     
                     results.push(PackageInfo {
@@ -149,25 +183,41 @@ fn search_pacman(term: &str) -> std::io::Result<Vec<PackageInfo>> {
     Ok(results)
 }
 
-fn search_aur(term: &str) -> std::io::Result<Vec<PackageInfo>> {
-    // Check if paru is installed
-    if Command::new("which").arg("paru").output()?.status.success() {
-        let output = Command::new("paru")
+async fn search_aur(term: &str) -> std::io::Result<Vec<PackageInfo>> {
+    // Check if paru or yay is installed
+    let paru_available = tokio::process::Command::new("which")
+        .arg("paru")
+        .output()
+        .await?
+        .status
+        .success();
+
+    let output = if paru_available {
+        tokio::process::Command::new("paru")
             .args(&["-Ss", "--aur", term])
-            .output()?;
-        
-        parse_aur_output(&output.stdout)
-    } else if Command::new("which").arg("yay").output()?.status.success() {
-        // Try yay if paru is not available
-        let output = Command::new("yay")
-            .args(&["-Ss", "--aur", term])
-            .output()?;
-        
-        parse_aur_output(&output.stdout)
+            .output()
+            .await?
     } else {
-        eprintln!("{}Warning:{} No AUR helper found (tried paru and yay). AUR search disabled.", RED, RESET);
-        Ok(Vec::new())
-    }
+        // Try yay if paru is not available
+        let yay_available = tokio::process::Command::new("which")
+            .arg("yay")
+            .output()
+            .await?
+            .status
+            .success();
+            
+        if yay_available {
+            tokio::process::Command::new("yay")
+                .args(&["-Ss", "--aur", term])
+                .output()
+                .await?
+        } else {
+            eprintln!("{}Warning:{} No AUR helper found (tried paru and yay). AUR search disabled.", RED, RESET);
+            return Ok(Vec::new());
+        }
+    };
+    
+    parse_aur_output(&output.stdout)
 }
 
 fn parse_aur_output(stdout: &[u8]) -> std::io::Result<Vec<PackageInfo>> {
@@ -177,7 +227,8 @@ fn parse_aur_output(stdout: &[u8]) -> std::io::Result<Vec<PackageInfo>> {
         return Ok(Vec::new());
     }
     
-    let mut results = Vec::new();
+    // Pre-allocate with approximate capacity
+    let mut results = Vec::with_capacity(stdout.lines().count() / 2);
     let mut lines = stdout.lines().peekable();
     
     while let Some(line) = lines.next() {
@@ -189,14 +240,11 @@ fn parse_aur_output(stdout: &[u8]) -> std::io::Result<Vec<PackageInfo>> {
                 if name_version.len() == 2 {
                     let name = name_version[0].trim();
                     
-                    // Extract version from the remaining part
+                    // Extract version from the remaining part more efficiently
                     let version_part = name_version[1].trim();
-                    let version = if version_part.starts_with('(') && version_part.contains(')') {
-                        // Extract what's inside the parentheses
-                        let v_start = version_part.find('(').unwrap_or(0) + 1;
-                        let v_end = version_part.find(')').unwrap_or(version_part.len());
-                        if v_start < v_end {
-                            version_part[v_start..v_end].to_string()
+                    let version = if let (Some(start), Some(end)) = (version_part.find('('), version_part.find(')')) {
+                        if start < end && start + 1 < version_part.len() {
+                            version_part[start+1..end].to_string()
                         } else {
                             version_part.to_string()
                         }
@@ -205,14 +253,9 @@ fn parse_aur_output(stdout: &[u8]) -> std::io::Result<Vec<PackageInfo>> {
                     };
                     
                     // Get description from the next line if available
-                    let description = if let Some(desc_line) = lines.next() {
-                        if desc_line.trim().is_empty() {
-                            "No description.".to_string()
-                        } else {
-                            desc_line.trim().to_string()
-                        }
-                    } else {
-                        "No description.".to_string()
+                    let description = match lines.next() {
+                        Some(desc_line) if !desc_line.trim().is_empty() => desc_line.trim().to_string(),
+                        _ => "No description.".to_string(),
                     };
                     
                     results.push(PackageInfo {
@@ -228,17 +271,25 @@ fn parse_aur_output(stdout: &[u8]) -> std::io::Result<Vec<PackageInfo>> {
     Ok(results)
 }
 
-fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
+async fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
     // Check if flatpak is installed
-    if !Command::new("which").arg("flatpak").output()?.status.success() {
+    let flatpak_available = tokio::process::Command::new("which")
+        .arg("flatpak")
+        .output()
+        .await?
+        .status
+        .success();
+        
+    if !flatpak_available {
         eprintln!("{}Warning:{} Flatpak not found. Flatpak search disabled.", RED, RESET);
         return Ok(Vec::new());
     }
 
-    // Run flatpak search with --columns=name,version,description to get proper fields
-    let output = Command::new("flatpak")
+    // Run flatpak search with --columns to improve parsing efficiency
+    let output = tokio::process::Command::new("flatpak")
         .args(&["search", "--columns=name,application,version,description", term])
-        .output()?;
+        .output()
+        .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     
@@ -246,10 +297,13 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
         return Ok(Vec::new());
     }
     
-    let mut results = Vec::new();
-    let lines = stdout.lines().skip(1); // Skip header row
+    // Pre-allocate with approximate capacity
+    let mut results = Vec::with_capacity(stdout.lines().count());
     
-    for line in lines {
+    // Convert term to lowercase once for case-insensitive comparison
+    let term_lower = term.to_lowercase();
+    
+    for line in stdout.lines().skip(1) { // Skip header row
         if line.is_empty() {
             continue;
         }
@@ -258,6 +312,12 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
         
         if parts.len() >= 4 {
             let name = parts[0].trim();
+            
+            // Only process further if the name matches (optimization)
+            if !name.to_lowercase().contains(&term_lower) {
+                continue;
+            }
+            
             let application_id = parts[1].trim();
             let version = match parts.get(2) {
                 Some(&v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -269,14 +329,11 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
                 _ => "No description.".to_string(),
             };
             
-            // Only add if the package matches the search term
-            if name.to_lowercase().contains(&term.to_lowercase()) {
-                results.push(PackageInfo {
-                    name: format!("{} ({})", name, application_id),
-                    version,
-                    description,
-                });
-            }
+            results.push(PackageInfo {
+                name: format!("{} ({})", name, application_id),
+                version,
+                description,
+            });
         }
     }
     
@@ -286,7 +343,9 @@ fn search_flatpak(term: &str) -> std::io::Result<Vec<PackageInfo>> {
 fn print_results_with_pager(results: &(Vec<PackageInfo>, Vec<PackageInfo>, Vec<PackageInfo>)) {
     let (pacman, aur, flatpak) = results;
     
-    let mut output = String::new();
+    // Pre-allocate string buffer with approximate capacity
+    let estimated_size = (pacman.len() + aur.len() + flatpak.len()) * 150;  // ~150 chars per package
+    let mut output = String::with_capacity(estimated_size);
     
     fn format_package_count(count: usize) -> String {
         if count == 1 {
@@ -319,8 +378,15 @@ fn print_results_with_pager(results: &(Vec<PackageInfo>, Vec<PackageInfo>, Vec<P
     print_category_results(&mut output, "AUR", aur, RED);
     print_category_results(&mut output, "Flatpak", flatpak, GREEN);
 
+    // Get terminal height for better pager decisioning
+    let term_height = match get_terminal_height() {
+        Some(h) => h,
+        None => 24, // Default fallback
+    };
+
     // Check if we should use pager based on output size and terminal height
-    let use_pager = output.lines().count() > 20; // Arbitrary threshold
+    let output_lines = output.lines().count();
+    let use_pager = output_lines > term_height - 2;
 
     if use_pager {
         // Check if 'less' is available
@@ -343,5 +409,23 @@ fn print_results_with_pager(results: &(Vec<PackageInfo>, Vec<PackageInfo>, Vec<P
     } else {
         // Print directly for small outputs
         println!("{}", output);
+    }
+}
+
+fn get_terminal_height() -> Option<usize> {
+    // Try to get terminal size using stty
+    let output = Command::new("stty")
+        .args(&["size"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+        
+    let size = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = size.split_whitespace().collect();
+    
+    if parts.len() >= 1 {
+        parts[0].parse::<usize>().ok()
+    } else {
+        None
     }
 }
