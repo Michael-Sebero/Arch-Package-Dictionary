@@ -1,11 +1,9 @@
 ## How to Use
 
 ```
-git clone https://github.com/Michael-Sebero/Arch-Package-Dictionary
+pd1 = paru
 
-cd /home/user/Arch-Package-Dictionary/paru
-
-cargo run
+pd2 = yay
 ```
 
 <p align="middle">
