@@ -1,6 +1,8 @@
 ## How to Use
 
 ```
+cd /path/to/binaries
+
 pd1 = paru
 
 pd2 = yay
