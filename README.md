@@ -1,7 +1,9 @@
 ## How to Use
 
 ```
-cd /path/to/binaries
+git clone https://github.com/Michael-Sebero/Arch-Package-Dictionary
+
+cd /home/$USER/Arch-Package-Dictionary/tools
 
 pd1 = paru
 
